@@ -30,6 +30,8 @@ def run_COLMAP(cfg, seq_id):
         pycolmap.extract_features(
             database_path=database_path,
             image_path=image_dir,
+            camera_mode=pycolmap.CameraMode.PER_FOLDER,
+            camera_model="PINHOLE",
         )
 
         # Feature Matching
@@ -82,12 +84,26 @@ def visualize_COLMAP(cfg, seq_id):
         time.sleep(1)
 
 
+def camera_to_K(cam):
+    # COLMAP param layouts differ per camera model (distortion is ignored here)
+    p = cam.params
+    name = str(cam.model.name) if hasattr(cam.model, "name") else str(cam.model)
+    name = name.split(".")[-1]
+    if name in ("SIMPLE_PINHOLE", "SIMPLE_RADIAL", "RADIAL"):
+        fx = fy = p[0]
+        cx, cy = p[1], p[2]
+    else:  # PINHOLE, OPENCV, FULL_OPENCV, ...: [fx, fy, cx, cy, ...]
+        fx, fy, cx, cy = p[0], p[1], p[2], p[3]
+    return np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
+
+
 def parse_colmap(rec, image_dir):
     images_dict = rec.images
     cameras_dict = rec.cameras
     
     viewmats_list = []
     gt_images_list = []
+    Ks_list = []
     
     # Sort image IDs based on image file names to maintain consistent order
     sorted_image_ids = sorted(images_dict.keys(), key=lambda k: images_dict[k].name)
@@ -106,18 +122,20 @@ def parse_colmap(rec, image_dir):
         pil_img = Image.open(img_path).convert("RGB")
         img_np = np.array(pil_img, dtype=np.float32) / 255.0
         gt_images_list.append(img_np)
+
+        cam = cameras_dict[img_obj.camera_id]
+        K_i = camera_to_K(cam)
+        # rescale intrinsics if the image resolution differs from the COLMAP camera
+        h, w = img_np.shape[:2]
+        K_i[0, :] *= w / cam.width
+        K_i[1, :] *= h / cam.height
+        Ks_list.append(K_i)
     
     viewmats_tensor = torch.tensor(np.array(viewmats_list), dtype=torch.float32, device=device)
     gt_images_tensor = torch.tensor(np.array(gt_images_list), dtype=torch.float32, device=device)
     
-    # 3) Extract Intrinsic Matrix (K) (based on the first camera)
-    cam = list(cameras_dict.values())[0]
-    fx, fy, cx, cy = cam.params[0], cam.params[1], cam.params[2], cam.params[3]
-    K_tensor = torch.tensor([
-        [fx,  0, cx],
-        [ 0, fy, cy],
-        [ 0,  0,  1]
-    ], dtype=torch.float32, device=device)
+    # 3) Per-view intrinsic matrices (N, 3, 3)
+    K_tensor = torch.tensor(np.array(Ks_list), dtype=torch.float32, device=device)
     
     # 4) Sparse Point Cloud (used as initial Gaussian positions for gsplat)
     points3D = rec.points3D
@@ -145,22 +163,32 @@ def train_gs(cfg, seq_id):
 
     ### 3D Gaussian initialization for gsplat (using COLMAP sparse points as initial positions)
     means3D = nn.Parameter(init_means3D.clone())
-    colors = nn.Parameter(init_colors.clone())
+    colors = nn.Parameter(torch.logit(init_colors.clamp(0.02, 0.98)))
 
     # Quaternion rotation (initialized as identity quaternions)
     init_quats = torch.zeros((num_points, 4), device=device)
     init_quats[:, 0] = 1.0
     quats = nn.Parameter(init_quats)
 
-    # Scale (defined in log-scale space)
-    scales = nn.Parameter(torch.log(torch.ones((num_points, 3), device=device) * 0.02))
+    # Scale (log space), initialized from mean distance to 3 nearest neighbours
+    dists = torch.cdist(init_means3D, init_means3D) if num_points <= 20000 else None
+    if dists is not None:
+        dists.fill_diagonal_(float("inf"))
+        knn = dists.topk(3, largest=False).values.mean(dim=-1)
+    else:
+        from scipy.spatial import cKDTree
+        d, _ = cKDTree(init_means3D.cpu().numpy()).query(init_means3D.cpu().numpy(), k=4)
+        knn = torch.tensor(d[:, 1:].mean(axis=-1), dtype=torch.float32, device=device)
+    knn = knn.clamp(min=1e-6)
+    scales = nn.Parameter(torch.log(knn)[:, None].repeat(1, 3))
 
     # Opacity (defined in logit space)
     opacities = nn.Parameter(torch.logit(torch.ones((num_points, 1), device=device) * 0.5))
 
     # Optimizer
+    scene_scale = float(knn.mean().item() * 100)
     optimizer = torch.optim.Adam([
-        {'params': [means3D], 'lr': 1e-4},
+        {'params': [means3D], 'lr': 1.6e-4 * scene_scale},
         {'params': [quats], 'lr': 1e-3},
         {'params': [scales], 'lr': 5e-3},
         {'params': [opacities], 'lr': 5e-2},
@@ -176,7 +204,7 @@ def train_gs(cfg, seq_id):
         total_loss = 0.0
         
         # Iterate over all camera views for the current epoch
-        for idx in range(num_views):
+        for idx in torch.randperm(num_views).tolist():
             optimizer.zero_grad()
             
             viewmat = viewmats[idx]
@@ -188,9 +216,9 @@ def train_gs(cfg, seq_id):
                 quats=torch.nn.functional.normalize(quats, dim=-1),
                 scales=torch.exp(scales),
                 opacities=torch.sigmoid(opacities.squeeze(-1)),
-                colors=colors,
+                colors=torch.sigmoid(colors),
                 viewmats=viewmat.unsqueeze(0),
-                Ks=K.unsqueeze(0),
+                Ks=K[idx].unsqueeze(0),
                 width=W,
                 height=H,
                 packed=False
@@ -200,6 +228,9 @@ def train_gs(cfg, seq_id):
             
             # Compute loss (L1 Loss + pixel error)
             loss = torch.mean(torch.abs(rendered_img - gt_img))
+            # penalize needle-like Gaussians (max/min scale ratio above 10)
+            s_exp = torch.exp(scales)
+            loss = loss + 0.01 * torch.relu(s_exp.max(dim=-1).values / s_exp.min(dim=-1).values - 10.0).mean()
             
             loss.backward()
             optimizer.step()
@@ -269,10 +300,10 @@ def load_ply(ply_path):
 
 def save_ply(filename, means3D, colors, scales, quats, opacities):
     xyz = means3D.detach().cpu().numpy()
-    rgb = colors.detach().cpu().numpy()
+    rgb = torch.sigmoid(colors.detach()).cpu().numpy()
     scale = scales.detach().cpu().numpy()
     opacity = opacities.detach().cpu().numpy()
-    rot = quats.detach().cpu().numpy()
+    rot = torch.nn.functional.normalize(quats.detach(), dim=-1).cpu().numpy()
 
     dtype = [
         ('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
@@ -303,7 +334,7 @@ def save_checkpoint(filename, means3D, colors, scales, quats, opacities, K):
         'scales': scales.detach().cpu(),
         'quats': quats.detach().cpu(),
         'opacities': opacities.detach().cpu(),
-        'K': K.detach().cpu(),
+        'K': K.detach().cpu(),  # (N, 3, 3) per-view
     }
 
     torch.save(checkpoint, filename)
