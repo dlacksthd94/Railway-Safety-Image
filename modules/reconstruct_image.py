@@ -6,6 +6,7 @@ from PIL import Image
 import torchvision.transforms as T
 import gsplat
 from gsplat import rasterization
+from gsplat.strategy import DefaultStrategy
 import pycolmap
 from pathlib import Path
 import time
@@ -185,55 +186,111 @@ def train_gs(cfg, seq_id):
     # Opacity (defined in logit space)
     opacities = nn.Parameter(torch.logit(torch.ones((num_points, 1), device=device) * 0.5))
 
-    # Optimizer
-    scene_scale = float(knn.mean().item() * 100)
-    optimizer = torch.optim.Adam([
-        {'params': [means3D], 'lr': 1.6e-4 * scene_scale},
-        {'params': [quats], 'lr': 1e-3},
-        {'params': [scales], 'lr': 5e-3},
-        {'params': [opacities], 'lr': 5e-2},
-        {'params': [colors], 'lr': 2.5e-3},
-    ])
+    # Scene extent = radius of the camera centers (used for lr and densification thresholds)
+    cam_centers = torch.linalg.inv(viewmats)[:, :3, 3]
+    scene_scale = float((cam_centers - cam_centers.mean(0)).norm(dim=-1).max().item())
+    scene_scale = max(scene_scale, 1e-3)
+
+    # One optimizer per parameter (required by gsplat strategies for densification/pruning)
+    params = nn.ParameterDict({
+        "means": means3D, "scales": scales, "quats": quats,
+        "opacities": opacities, "colors": colors,
+    })
+    lrs = {"means": 1.6e-4 * scene_scale, "scales": 5e-3, "quats": 1e-3,
+           "opacities": 5e-2, "colors": 2.5e-3}
+
+    # Resume from checkpoint if it exists (the Gaussian count may differ from the init due to densification)
+    fp_gs_checkpoint = Path(cfg.path.dir_gs) / seq_id / "gs_checkpoint.pt"
+    ckpt = None
+    if fp_gs_checkpoint.exists():
+        ckpt = torch.load(fp_gs_checkpoint, map_location=device)
+        # new format: ckpt["params"]; legacy format: flat tensors with 'means3D' instead of 'means'
+        saved = ckpt.get("params", ckpt)
+        saved = {("means" if k == "means3D" else k): v for k, v in saved.items()}
+        for k in params.keys():
+            params[k] = nn.Parameter(saved[k].to(device))
+        print(f"Resuming from {fp_gs_checkpoint}: epoch {ckpt.get('epoch', 0)}, step {ckpt.get('step', 0)}, "
+              f"{len(params['means'])} Gaussians")
+
+    optimizers = {k: torch.optim.Adam([params[k]], lr=lr) for k, lr in lrs.items()}
+    # legacy checkpoints have no optimizer/strategy/scheduler state: warm start only
+    full_state = ckpt is not None and "optimizers" in ckpt
+    if full_state:
+        for k, opt in optimizers.items():
+            opt.load_state_dict(ckpt["optimizers"][k])
+
+    epochs = 1000
+    total_steps = epochs * num_views
+
+    # Densification (clone/split) and pruning (low opacity / too big) from gsplat
+    strategy = DefaultStrategy(
+        prune_opa=0.005,
+        grow_grad2d=0.0002,
+        grow_scale3d=0.01,
+        prune_scale3d=0.1,
+        refine_start_iter=min(500, total_steps // 10),
+        refine_stop_iter=int(total_steps),
+        refine_every=100,
+        reset_every=3000,
+        verbose=True,
+    )
+    strategy.check_sanity(params, optimizers)
+    strategy_state = strategy.initialize_state(scene_scale=scene_scale)
+
+    means_sched = torch.optim.lr_scheduler.ExponentialLR(
+        optimizers["means"], gamma=0.01 ** (1.0 / total_steps)
+    )
+
+    step, start_epoch = 0, 0
+    if full_state:
+        means_sched.load_state_dict(ckpt["scheduler"])
+        step, start_epoch = ckpt["step"], ckpt["epoch"]
+
+    def save_state(epoch_done):
+        save_checkpoint(fp_gs_checkpoint, params, optimizers, strategy_state, means_sched, K, epoch_done, step)
 
     ### Training loop for gsplat
-    epochs = 500
     print("\n--- Start gsplat Training ---")
 
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         start_time = time.time()
         total_loss = 0.0
         
         # Iterate over all camera views for the current epoch
         for idx in torch.randperm(num_views).tolist():
-            optimizer.zero_grad()
-            
             viewmat = viewmats[idx]
             gt_img = gt_images[idx]
             
             # Run gsplat CUDA rasterizer
             renders, alphas, meta = rasterization(
-                means=means3D,
-                quats=torch.nn.functional.normalize(quats, dim=-1),
-                scales=torch.exp(scales),
-                opacities=torch.sigmoid(opacities.squeeze(-1)),
-                colors=torch.sigmoid(colors),
+                means=params["means"],
+                quats=torch.nn.functional.normalize(params["quats"], dim=-1),
+                scales=torch.exp(params["scales"]),
+                opacities=torch.sigmoid(params["opacities"].squeeze(-1)),
+                colors=torch.sigmoid(params["colors"]),
                 viewmats=viewmat.unsqueeze(0),
                 Ks=K[idx].unsqueeze(0),
                 width=W,
                 height=H,
                 packed=False
             )
+            strategy.step_pre_backward(params, optimizers, strategy_state, step, meta)
             
             rendered_img = renders.squeeze(0)
             
             # Compute loss (L1 Loss + pixel error)
             loss = torch.mean(torch.abs(rendered_img - gt_img))
             # penalize needle-like Gaussians (max/min scale ratio above 10)
-            s_exp = torch.exp(scales)
+            s_exp = torch.exp(params["scales"])
             loss = loss + 0.01 * torch.relu(s_exp.max(dim=-1).values / s_exp.min(dim=-1).values - 10.0).mean()
             
             loss.backward()
-            optimizer.step()
+            for opt in optimizers.values():
+                opt.step()
+                opt.zero_grad(set_to_none=True)
+            means_sched.step()
+            strategy.step_post_backward(params, optimizers, strategy_state, step, meta, packed=False)
+            step += 1
             
             total_loss += loss.item()
         
@@ -241,16 +298,17 @@ def train_gs(cfg, seq_id):
         elapsed = time.time() - start_time
         
         if (epoch + 1) % 50 == 0 or epoch == 0:
-            print(f"Epoch [{epoch+1:03d}/{epochs}] - Avg L1 Loss: {avg_loss:.6f} ({elapsed:.2f}s/epoch)")
+            print(f"Epoch [{epoch+1:03d}/{epochs}] - Avg L1 Loss: {avg_loss:.6f} - Gaussians: {len(params['means'])} ({elapsed:.2f}s/epoch)")
+
+        if (epoch + 1) % 25 == 0:
+            save_state(epoch + 1)
     print("Training completed!")
 
     fn_gs_output = "gs_output.ply"
     fp_gs_output = Path(cfg.path.dir_gs) / seq_id / fn_gs_output
-    save_ply(fp_gs_output, means3D, colors, scales, quats, opacities)
+    save_ply(fp_gs_output, params["means"], params["colors"], params["scales"], params["quats"], params["opacities"])
 
-    fn_gs_checkpoint = 'gs_checkpoint.pt'
-    fp_gs_checkpoint = Path(cfg.path.dir_gs) / seq_id / fn_gs_checkpoint
-    save_checkpoint(fp_gs_checkpoint, means3D, colors, scales, quats, opacities, K)
+    save_state(max(start_epoch, epochs))
 
 
 def visualize_gs(cfg, seq_id):
@@ -327,17 +385,21 @@ def save_ply(filename, means3D, colors, scales, quats, opacities):
     PlyData([el]).write(filename)
 
 
-def save_checkpoint(filename, means3D, colors, scales, quats, opacities, K):
+def save_checkpoint(filename, params, optimizers, strategy_state, scheduler, K, epoch, step):
     checkpoint = {
-        'means3D': means3D.detach().cpu(),
-        'colors': colors.detach().cpu(),
-        'scales': scales.detach().cpu(),
-        'quats': quats.detach().cpu(),
-        'opacities': opacities.detach().cpu(),
+        'params': {k: v.detach().cpu() for k, v in params.items()},
+        'optimizers': {k: o.state_dict() for k, o in optimizers.items()},
+        'strategy_state': strategy_state,
+        'scheduler': scheduler.state_dict(),
         'K': K.detach().cpu(),  # (N, 3, 3) per-view
+        'epoch': epoch,
+        'step': step,
     }
 
-    torch.save(checkpoint, filename)
+    # write atomically so an interrupted save never corrupts the checkpoint
+    tmp = Path(str(filename) + ".tmp")
+    torch.save(checkpoint, tmp)
+    tmp.replace(filename)
 
 if __name__ == "__main__":
     # visualize_COLMAP(cfg, seq_id)
